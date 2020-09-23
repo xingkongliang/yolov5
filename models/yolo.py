@@ -1,4 +1,5 @@
 import argparse
+import logging
 import math
 from copy import deepcopy
 from pathlib import Path
@@ -6,17 +7,21 @@ from pathlib import Path
 import torch
 import torch.nn as nn
 
-from models.common import Conv, Bottleneck, SPP, DWConv, Focus, BottleneckCSP, Concat
+from models.common import Conv, Bottleneck, SPP, DWConv, Focus, BottleneckCSP, Concat, NMS
 from models.experimental import MixConv2d, CrossConv, C3
-from utils.general import check_anchor_order, make_divisible, check_file
+from utils.general import check_anchor_order, make_divisible, check_file, set_logging
 from utils.torch_utils import (
     time_synchronized, fuse_conv_and_bn, model_info, scale_img, initialize_weights, select_device)
 
+logger = logging.getLogger(__name__)
+
 
 class Detect(nn.Module):
+    stride = None  # strides computed during build
+    export = False  # onnx export
+
     def __init__(self, nc=80, anchors=(), ch=()):  # detection layer
         super(Detect, self).__init__()
-        self.stride = None  # strides computed during build
         self.nc = nc  # number of classes
         self.no = nc + 5  # number of outputs per anchor
         self.nl = len(anchors)  # number of detection layers
@@ -26,7 +31,6 @@ class Detect(nn.Module):
         self.register_buffer('anchors', a)  # shape(nl,na,2)
         self.register_buffer('anchor_grid', a.clone().view(self.nl, 1, -1, 1, 1, 2))  # shape(nl,1,na,1,1,2)
         self.m = nn.ModuleList(nn.Conv2d(x, self.no * self.na, 1) for x in ch)  # output conv
-        self.export = False  # onnx export
 
     def forward(self, x):
         # x = x.copy()  # for profiling
@@ -67,7 +71,7 @@ class Model(nn.Module):
 
         # Define model
         if nc and nc != self.yaml['nc']:
-            print('Overriding %s nc=%g with nc=%g' % (cfg, self.yaml['nc'], nc))
+            print('Overriding model.yaml nc=%g with nc=%g' % (self.yaml['nc'], nc))
             self.yaml['nc'] = nc  # override yaml value
         self.model, self.save = parse_model(deepcopy(self.yaml), ch=[ch])  # model, savelist, ch_out
         # print([x.shape for x in self.forward(torch.zeros(1, ch, 64, 64))])
@@ -154,22 +158,31 @@ class Model(nn.Module):
     #             print('%10.3g' % (m.w.detach().sigmoid() * 2))  # shortcut weights
 
     def fuse(self):  # fuse model Conv2d() + BatchNorm2d() layers
-        print('Fusing layers... ', end='')
+        print('Fusing layers... ')
         for m in self.model.modules():
-            if type(m) is Conv:
+            if type(m) is Conv and hasattr(Conv, 'bn'):
                 m._non_persistent_buffers_set = set()  # pytorch 1.6.0 compatability
                 m.conv = fuse_conv_and_bn(m.conv, m.bn)  # update conv
-                m.bn = None  # remove batchnorm
+                delattr(m, 'bn')  # remove batchnorm
                 m.forward = m.fuseforward  # update forward
         self.info()
         return self
 
-    def info(self):  # print model information
-        model_info(self)
+    def add_nms(self):  # fuse model Conv2d() + BatchNorm2d() layers
+        if type(self.model[-1]) is not NMS:  # if missing NMS
+            print('Adding NMS module... ')
+            m = NMS()  # module
+            m.f = -1  # from
+            m.i = self.model[-1].i + 1  # index
+            self.model.add_module(name='%s' % m.i, module=m)  # add
+        return self
+
+    def info(self, verbose=False):  # print model information
+        model_info(self, verbose)
 
 
 def parse_model(d, ch):  # model_dict, input_channels(3)
-    print('\n%3s%18s%3s%10s  %-40s%-30s' % ('', 'from', 'n', 'params', 'module', 'arguments'))
+    logger.info('\n%3s%18s%3s%10s  %-40s%-30s' % ('', 'from', 'n', 'params', 'module', 'arguments'))
     anchors, nc, gd, gw = d['anchors'], d['nc'], d['depth_multiple'], d['width_multiple']
     na = (len(anchors[0]) // 2) if isinstance(anchors, list) else anchors  # number of anchors
     no = na * (nc + 5)  # number of outputs = anchors * (classes + 5)
@@ -184,7 +197,7 @@ def parse_model(d, ch):  # model_dict, input_channels(3)
                 pass
 
         n = max(round(n * gd), 1) if n > 1 else n  # depth gain
-        if m in [nn.Conv2d, Conv, Bottleneck, SPP, DWConv, MixConv2d, Focus, CrossConv, BottleneckCSP, C3]:
+        if m in [Conv, Bottleneck, SPP, DWConv, MixConv2d, Focus, CrossConv, BottleneckCSP, C3]:
             c1, c2 = ch[f], args[0]
 
             # Normal
@@ -224,7 +237,7 @@ def parse_model(d, ch):  # model_dict, input_channels(3)
         t = str(m)[8:-2].replace('__main__.', '')  # module type
         np = sum([x.numel() for x in m_.parameters()])  # number params
         m_.i, m_.f, m_.type, m_.np = i, f, t, np  # attach index, 'from' index, type, number params
-        print('%3s%18s%3s%10.0f  %-40s%-30s' % (i, f, n, np, t, args))  # print
+        logger.info('%3s%18s%3s%10.0f  %-40s%-30s' % (i, f, n, np, t, args))  # print
         save.extend(x % i for x in ([f] if isinstance(f, int) else f) if x != -1)  # append to savelist
         layers.append(m_)
         ch.append(c2)
@@ -237,6 +250,7 @@ if __name__ == '__main__':
     parser.add_argument('--device', default='', help='cuda device, i.e. 0 or 0,1,2,3 or cpu')
     opt = parser.parse_args()
     opt.cfg = check_file(opt.cfg)  # check file
+    set_logging()
     device = select_device(opt.device)
 
     # Create model
